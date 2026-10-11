@@ -17,6 +17,13 @@ temporal taxonomy, see docs/plans/2026-09-08-2165-connected-assembly.md):
   (#2653): "the order ...: A, B, and C" / "first, A, B or C" — 3+ named
   options decomposed over the SAME dated spine (see the N-ary section
   below).
+* ``relative-date-lookup`` — "last Saturday", "on Valentine's day", "the
+  past weekend": a DETERMINISTIC calendar anchor (fixed-date holiday, or a
+  weekday/weekend offset from ``question_date``) feeding an as-of EQUALITY-DAY
+  lookup over the typed spine (#2655). Measured coverage of the census class is
+  3/6 — the class's other 3 rows name no calendar anchor at all (one is an
+  ``ago``-offset day, #2652's class; one is ordering-within-a-month; one is
+  frequency/count, #2886's class) and stay non-firing by design.
 * ``interval`` — "How many days/weeks/months/years passed between A and B"
   and the two-anchor since-until form "…had passed since X when Y".
 * ``duration-state`` — #2654: "how long had I been <state> when <event>?"
@@ -43,17 +50,19 @@ the state-entry duration-state rows into a shape; of the residual 39 rows
 only the 2 adjudicated label-noise rows fire, so the floor's
 non-adjudicated denominator is rejected 37/37 — see the floor test):
 
-* the residual census negatives — the measured floor denominator after
-  BOTH promotions: #2652 removed the 34 promoted rows (ago-relative 31 +
-  recency 2 + the 1 morphologically-promoted mis-file) and #2654 removed
-  the 5 state-entry duration-state rows it now fires on, leaving the 39
-  rows across frequency/count, the 2 residual duration-state rows,
-  relative-date-lookup, nary-ordering, other, pattern/recurring,
-  offset-comparison and recency/current-state. 2 fire, both pinned
-  ADJUDICATED label-noise rows (370a8ff4 + gpt4_70e84552_abs). NOTE the
-  #2165 figure (76/78) is NOT comparable: 34 of those 78 are now deliberate
-  positives of the ``ago-relative`` shape (78 − 34 − the 5 #2654
-  state-entry rows = the pinned 39-row residual);
+* the residual census negatives — the measured floor denominator after ALL
+  FOUR promotions: #2652 removed the 34 promoted ago/recency rows (31 + 2
+  + the 1 morphologically-promoted mis-file), #2653 re-measured
+  nary-ordering (2 genuine named-subject rows now fire; its other 2 rows
+  adjudicated), #2654 removed the 5 state-entry duration-state rows it now
+  fires on, and #2655 removed the calendar-anchored rows of
+  ``relative-date-lookup`` (plus the 3 rows the census misfiled OUT of the
+  class — see ``_RELATIVE_DATE_CLASS_EXPANSION`` in the test file). Of what
+  remains, the only permitted fires are the ADJUDICATED label-noise rows
+  (370a8ff4 + gpt4_70e84552_abs); the test file is the authority for every
+  count and for the floor.
+  'ago' rejects EVEN with state morphology "what is the current status of X
+  two weeks ago?" (reject-on-relative-offset);
 * duration-state residual forms — "how long did I take … combined" (a
   summed span: #2886's aggregate lane owns it) and "how old was I when …"
   (an age: no state entry to resolve); plus every other duration/count
@@ -62,7 +71,10 @@ non-adjudicated denominator is rejected 37/37 — see the floor test):
 * frequency/count — "how many times", "how many days did I spend", "how
   many … have passed since <one activity>" (single-anchor since);
 * relative-date-lookup — "last Saturday", "on Valentine's day" (sibling
-  #2655's CALENDAR-ANCHOR family — deliberately NOT promoted here);
+  #2655's CALENDAR-ANCHOR family — deliberately NOT promoted here); the
+  three census rows of the class that name NO calendar anchor ("a week
+  ago", "the first … in June", "the most in March and April") stay here
+  too;
 * nary-ordering — 3+ named options ("Mark and Sarah or Tom"), sibling
   #2653; and bare "latest" as an ORDERING INSTRUCTION ("from earliest to
   latest"). The census's nary-ordering class is RE-MEASURED to 2
@@ -101,6 +113,8 @@ from __future__ import annotations
 import re
 from enum import StrEnum
 
+from tortoise.calendar_anchors import (  # #2655 calendar-anchor resolution
+    find_anchor_spans, resolve_calendar_anchor)
 from tortoise.entity_identity import (  # #3633 route-then-refuse
     display_holder_ids, record_non_folded)
 from tortoise.fanout import PER_ENTITY_FANOUT_CAP, bounded_fanout
@@ -113,6 +127,9 @@ class AssemblyShape(StrEnum):
     CURRENT_STATE = "current-state"
     ORDERING = "ordering"
     INTERVAL = "interval"
+    # #2655: the census class name verbatim, so measurement attribution over
+    # the fired decision reads the same string the census carries.
+    RELATIVE_DATE = "relative-date-lookup"
     # #2654 — the state-entry anchor variant ("how long had I been X when Y")
     DURATION_STATE = "duration-state"
     #: #2652 — 'ago'-relative / implicit-time: the question carries a
@@ -596,6 +613,70 @@ _RE_CURRENT = re.compile(
 _RE_CURRENT_STILL = re.compile(
     r"^\s*is\s+(?P<a>.+?)\s+still\s+(?:live|active|around|in\s+use|mine)"
     r"\??\s*$", re.IGNORECASE | re.DOTALL)
+# #2655 date-lookup surface: the question asks FOR something about the anchored
+# occasion (a wh-lookup), rather than merely mentioning the day.
+_RE_WH_LOOKUP = re.compile(r"\b(?:what|which|who|whom|whose|where|when)\b",
+                           re.IGNORECASE)
+
+
+def _strip_anchor_spans(question: str, spans) -> str:
+    """``question`` with each matched anchor span blanked (R2655).
+
+    The residual is what the R13 relative-offset guard and the
+    duration/frequency/recency/advice guards are evaluated against, so a
+    NON-anchor relative offset co-present with an anchor ("… two months ago or
+    … last Saturday") still rejects the question — the anchor must not act as a
+    shield for another shape's morphology.
+    """
+    out = question
+    for span in sorted(spans, key=lambda s: s.start, reverse=True):
+        out = out[:span.start] + " " + out[span.end:]
+    return out
+
+
+def _date_lookup_surface(question: str, residual: str, spans) -> bool:
+    """#2655: is this calendar-anchor question a DATE LOOKUP?
+
+    High precision by construction, and deliberately NARROW: the caller falls
+    through to the unchanged classifier body for every rejection, so a
+    question whose anchors belong to another shape keeps that shape, and every
+    guard-rejected phrasing stays rejected.
+
+    * ONE distinct anchor only — two anchors ("between Christmas and New
+      Year's day …") is an interval, not a day lookup;
+    * a wh-lookup surface must be present;
+    * no competing shape template matches the question (ordering / interval /
+      current-state own it);
+    * no competing guard matches the anchor-stripped RESIDUAL (a non-anchor
+      relative offset, a duration/frequency/recency/advice surface, or an
+      N-ary list).
+    """
+    if len({(s.kind, s.label) for s in spans}) != 1:
+        return False
+    if not _RE_WH_LOOKUP.search(question):
+        return False
+    if (_RE_ORDERING.match(question) or _RE_CURRENT.match(question)
+            or _RE_CURRENT_STILL.match(question)
+            or _RE_INTERVAL_SINCE.match(question)
+            or _RE_INTERVAL_BETWEEN.match(question)
+            or _RE_INTERVAL_BETWEEN_LEAD.match(question)
+            or _RE_DURATION_STATE.match(question)):
+        return False
+    # #2652 split the pre-merge `_RE_AGO` guard into THREE parts -- the
+    # CALENDAR-anchor residue (`_RE_AGO_OTHER`), the PROMOTED relative
+    # vocabulary (`_relative_match`), and the un-promoted bare-`ago` residue
+    # (`_RE_AGO_RESIDUAL`) -- so a non-anchor relative offset in the residual
+    # is whichever of the three owns it and ALL must reject here. (The union
+    # is exactly the old guard: `_RE_AGO` ≡ `_RE_AGO_OTHER ∪ \bago\b`, and
+    # `_relative_match` is a subset of the bare-`ago` residue -- it is named
+    # explicitly because it is the vocabulary the promoted forms route on.)
+    return not (
+        _RE_AGO_OTHER.search(residual)
+        or _relative_match(residual) is not None
+        or _RE_AGO_RESIDUAL.search(residual)
+        or _RE_DURATION.search(residual)
+        or _RE_FREQUENCY.search(residual) or _RE_RECENCY.search(residual)
+        or _RE_ADVICE.search(residual) or _RE_OR_CHAIN.search(residual))
 # duration-state (#2654): "how long had I been <state> when <event>?" — the
 # past-elapsed-state form that needs a state's ENTRY date and the question's
 # as-of anchor (never an interval: the two anchors are the subject's state
@@ -699,6 +780,35 @@ def classify_question(question: str) -> AssemblyShape | None:
     if not question or not question.strip():
         return None
     q = question.strip()
+    # #2655: a calendar-anchored date lookup is decided FIRST, and — when an
+    # anchor surface is present at all — this function NEVER falls through to
+    # the other templates without the R13 re-check below. Both halves are
+    # deliberate:
+    #   * the anchor branch must precede the R13 guards, because the
+    #     CALENDAR-anchor vocabulary (`last <weekday>` / `last weekend` /
+    #     `valentine`) is exactly the set #2652 kept in `_RE_AGO_OTHER`, and
+    #     that guard would otherwise swallow the shape;
+    #   * a question that carries an anchor AND another shape's morphology must
+    #     return None ("… two months ago or … last Saturday?" is NOT a date
+    #     lookup, and the ordering template would otherwise fire on it and
+    #     REGRESS a pinned negative).
+    spans = find_anchor_spans(q)
+    if spans:
+        if _date_lookup_surface(q, _strip_anchor_spans(q, spans), spans):
+            return AssemblyShape.RELATIVE_DATE
+        # NOT a day lookup. The anchor branch may only change a decision the
+        # R13 guard made ON THE ANCHOR SURFACE itself: an anchor-bearing
+        # question containing `last <weekday>`/`last weekend`/`valentine`
+        # returned None pre-#2655 because that CALENDAR vocabulary was
+        # guarded, so a hit here MUST stay None — the anchor may never act as
+        # a shield that lets another shape (or an ordering template sitting
+        # next to a non-anchor `ago` offset) fire on a question it would have
+        # been rejected for. Anything else (a state probe with a HOLIDAY
+        # adjunct, two holidays inside a `between … and …` interval) falls
+        # through to the unchanged body below and keeps the shape it already
+        # had.
+        if _RE_AGO_OTHER.search(q):
+            return None
     # R13 rejects that are NOT promotable — mutually independent "return
     # None" clauses, so their order among themselves carries no semantics.
     # They run FIRST: the CALENDAR-anchor vocabulary (sibling #2655's
@@ -983,6 +1093,12 @@ def extract_subject_terms(question: str,
     if shape is None:
         return []
     q = question.strip()
+    if shape is AssemblyShape.RELATIVE_DATE:
+        # #2655: the DAY is the scope, not a subject — there is no entity span
+        # to resolve, and the caller's fired path branches before extraction.
+        # Returning a span here would feed the resolver a fragment of the
+        # question (e.g. "the past weekend") and fabricate a subject.
+        return []
     if shape is AssemblyShape.AGO_RELATIVE:
         # #2652: the SELECTOR is the time window resolved by
         # ``resolve_relative_anchor`` against question_date — not an
@@ -1621,6 +1737,11 @@ class WalkerPort(Protocol):
     def spine_rows(self, object_ids: list[str],
                    per_subject_cap: int) -> list[dict]: ...
 
+    # #2655: the equality-day probe (no subject anchor — the day IS the
+    # scope). Returns a SUPERSET: the day filter is decided on the R2 ladder
+    # date in ``collect_day_slices``, never by the port's predicate alone.
+    def day_rows(self, days: tuple, per_day_cap: int) -> list[dict]: ...
+
 
 def _norm_date(value) -> _date | None:
     """Shared date normalization — the SINGLE source for the as-of equality
@@ -1745,6 +1866,72 @@ def collect_slices(port: WalkerPort, candidates: list[SubjectCandidate], *,
                    "truncated": truncated})
 
 
+def collect_day_slices(port: WalkerPort, days,
+                       *, per_day_cap: int = PER_ENTITY_FANOUT_CAP,
+                       ) -> AssemblySlices:
+    """#2655 — the as-of EQUALITY-DAY lookup over the typed spine.
+
+    Same contract as ``collect_slices`` (ONE batched read, the R2 date ladder
+    as the SINGLE date source, ``bounded_fanout`` clamp, an admission census),
+    with the subject anchor replaced by the resolved DAY:
+
+    * the port's ``day_rows`` read is a bounded SUPERSET probe (a date prefix
+      is the only index-friendly predicate available); membership is decided
+      HERE, on the ladder date, so a row whose truthy ``when`` shadows a
+      matching ``createdAt`` is admitted on its OWN date or not at all — never
+      by an or-chain that would re-derive a date the walker already resolved;
+    * **undated rows are excluded outright** (unlike ``collect_slices``, which
+      keeps them undated-last): an undated row can never satisfy a day
+      equality, and keeping it would render an unrelated row under a
+      ``DATE (…)`` header — a fabricated date claim;
+    * the per-day cap is applied AFTER the membership filter, so a row dated
+      elsewhere (a port over-fetch) cannot consume the day's budget.
+
+    Deterministic order: ``(date, kind, id)`` — input-order independent.
+    """
+    day_set = {d for d in days if isinstance(d, _date)}
+    if not day_set:
+        return AssemblySlices()
+    cap = bounded_fanout(per_day_cap)
+    ordered_days = tuple(sorted(day_set))
+    raw = list(port.day_rows(ordered_days, cap) or [])
+
+    rows: list[dict] = []
+    seen: set[str] = set()
+    per_day_counts: dict[_date, int] = {}
+    for row in raw:
+        row = dict(row)
+        rid = row.get("id")
+        if rid is not None:
+            key = str(rid)
+            if key in seen:
+                continue
+            seen.add(key)
+        tier, d = _tier_and_date(row)
+        if d is None or d not in day_set:
+            continue
+        per_day_counts[d] = per_day_counts.get(d, 0) + 1
+        if per_day_counts[d] > cap:
+            continue
+        row["tier"] = tier
+        row["date"] = d
+        rows.append(row)
+
+    # (date, kind, id) — date-major, then the row kind, then the id: the same
+    # TOTAL key the subject sections use, extended with the kind so a Point
+    # and an Event sharing an id can never swap places between runs.
+    rows.sort(key=lambda r: (r["date"], _as_str(r.get("kind")),
+                             _as_str(r.get("id"))))
+    return AssemblySlices(
+        state_rows=(),
+        timeline_rows=tuple(rows),
+        evidence_rows=tuple(r for r in rows if r.get("kind") == "point"),
+        admission={"rows_requested": cap * len(ordered_days),
+                   "rows_admitted": len(rows),
+                   "truncated": any(v >= cap
+                                    for v in per_day_counts.values())})
+
+
 def docker_walker_port(sdk) -> WalkerPort:
     """Adapter over a live TortoiseSDK: the state read is ONE batched
     Cypher statement (status/supersededBy/supersededAt together — no torn
@@ -1823,6 +2010,64 @@ def docker_walker_port(sdk) -> WalkerPort:
                             "content": r[2], "started_at": r[3],
                             "status": r[4], "lme_event_id": r[5],
                             "lme_session_index": r[6]})
+        return out
+
+    def day_rows(days: tuple, per_day_cap: int = PER_ENTITY_FANOUT_CAP,
+                 ) -> list[dict]:
+        # #2655: the equality-day probe. ONE prefix-range statement per day
+        # per kind (bounded: 2 kinds x len(days) — never row-level N+1).
+        #
+        # The predicate is a SUPERSET: `when` and `createdAt` are both probed
+        # with `STARTS WITH <day>` because the R2 ladder makes `when`
+        # authoritative when it parses — so a row whose `when` says another day
+        # IS returned here and is then dropped by `collect_day_slices` on its
+        # ladder date. Pushing a single conjunct down instead would silently
+        # DROP a genuine day row whose `when` is unparseable but whose
+        # `createdAt` is the day (a false negative the ladder exists to
+        # prevent). `STARTS WITH` on a null property yields null (falsy) —
+        # undated rows are never matched.
+        #
+        # ORDER BY id mirrors `spine_rows` (deterministic, per-kind) — the
+        # collector re-sorts on (date, kind, id), so the returned order is an
+        # implementation detail, not the contract.
+        if not days:
+            return []
+        cap = bounded_fanout(per_day_cap)
+        out: list[dict] = []
+        for d in days:
+            day = d.isoformat()
+            prow = proj.g.query(
+                "MATCH (p:Point) "
+                "WHERE p.when STARTS WITH $day "
+                "OR p.createdAt STARTS WITH $day "
+                "RETURN 'point' AS kind, p.id, p.content, p.when, "
+                "p.createdAt, p.status, p.validFrom, p.validTo, "
+                "p.expiredAt, p.ep_alpha, p.ep_beta, p.quote, "
+                "p.search_keys, p.eventId, p.lme_session_index "
+                "ORDER BY p.id LIMIT $cap",
+                params={"day": day, "cap": cap}).result_set
+            for r in prow:
+                out.append({"kind": r[0], "id": r[1], "content": r[2],
+                            "when": r[3], "created_at": r[4],
+                            "status": r[5], "valid_from": r[6],
+                            "valid_to": r[7], "expired_at": r[8],
+                            "ep_alpha": r[9], "ep_beta": r[10],
+                            "quote": r[11], "search_keys": r[12],
+                            "event_id": r[13], "lme_session_index": r[14]})
+            erow = proj.g.query(
+                "MATCH (e:Event) "
+                "WHERE e.startedAt STARTS WITH $day "
+                "OR e.when STARTS WITH $day "
+                "RETURN 'event' AS kind, e.eventId, e.name, e.startedAt, "
+                "e.status, e.lme_event_id, e.lme_session_index "
+                "ORDER BY e.eventId LIMIT $cap",
+                params={"day": day, "cap": cap}).result_set
+            for r in erow:
+                # the Event node stores its human text under `name` (mirrors
+                # ``spine_rows`` — never `content`)
+                out.append({"kind": r[0], "id": r[1], "content": r[2],
+                            "started_at": r[3], "status": r[4],
+                            "lme_event_id": r[5], "lme_session_index": r[6]})
         return out
 
     def window_rows(lo, hi, cap=PER_ENTITY_FANOUT_CAP) -> list[dict]:
@@ -1909,6 +2154,7 @@ def docker_walker_port(sdk) -> WalkerPort:
     import types
     return types.SimpleNamespace(state_rows=state_rows,
                                  spine_rows=spine_rows,
+                                 day_rows=day_rows,
                                  window_rows=window_rows)
 
 
@@ -2102,6 +2348,40 @@ def _state_header_hit(sr: dict, label: str,
             "superseded_by": sb}
 
 
+def _date_section_hits(slices: AssemblySlices,
+                       anchor) -> list[dict]:
+    """#2655 — the date-scoped block: ONE synthesized header naming the
+    RESOLVED day(s), then every admitted row of that day in the walker's own
+    date order.
+
+    There is no resolved subject to head a section (the day IS the scope), so
+    the subject-section loop does not run here. Rows are cleaned of the
+    pure-walker derivation keys ({date, tier}) exactly as the subject sections
+    do; the header is the ONLY line this renderer invents. Empty slices render
+    NOTHING (the caller's P1-1 gate then keeps the fired decision false — a
+    bare header would replace a working legacy pool with a dateline).
+    """
+    if anchor is None or not slices.timeline_rows:
+        return []
+    days = ", ".join(d.isoformat() for d in anchor.days)
+    rows = sorted(slices.timeline_rows,
+                  key=lambda r: (r.get("date") or _date.max,
+                                 _as_str(r.get("kind")),
+                                 _as_str(r.get("id"))))
+    hits: list[dict] = [{"content": f"DATE ({anchor.label}): {days}",
+                         "kind": "date"}]
+    seen: set[str] = set()
+    for r in rows:
+        rid = r.get("id")
+        if rid is not None:
+            key = str(rid)
+            if key in seen:
+                continue
+            seen.add(key)
+        hits.append({k: v for k, v in r.items() if k not in ("date", "tier")})
+    return hits
+
+
 def _ago_offset_line(d: _date, qd: _date, unit: str | None) -> str:
     """#2652 deterministic elapsed arithmetic: ``<date> — N <unit> before
     <question_date>``. PURE INTEGER DATE MATH via ``_norm_date`` (the same
@@ -2165,6 +2445,7 @@ def synthesize_hits(
     candidates: tuple | list = (), halves: tuple | list = (),
     successors_verified: frozenset[str] = frozenset(),
     question_date: str | None = None,
+    date_anchor=None,
     anchor=None,
 ) -> list[dict]:
     """Render slices -> annotated hit dicts (the assemble_context input).
@@ -2172,12 +2453,16 @@ def synthesize_hits(
     Deterministic: subject-major sections in candidate order, rows
     chronological within a section; state/ordering/interval lines computed
     through the SHARED _norm_date helper (never an independent date lib).
+    For ``RELATIVE_DATE`` the day's own block is rendered (#2655) — see
+    ``_date_section_hits``.
 
     #2652: ``AGO_RELATIVE`` has NO subject sections (the selector is the
     time window) — it renders through ``_synthesize_ago_hits`` and needs
     ``anchor``; without it the shape renders nothing (the caller's
     empty-block guard then falls back to legacy).
     """
+    if shape is AssemblyShape.RELATIVE_DATE:
+        return _date_section_hits(slices, date_anchor)
     if shape is AssemblyShape.AGO_RELATIVE:
         if anchor is None:
             return []
@@ -2829,6 +3114,55 @@ def _assemble_under_caps(hits: list[dict], *, caps: dict,
     return selected, cap_stats
 
 
+def _empty_block() -> _AssembledBlock:
+    """The R1/P1-1 fall-through: fire NOTHING and let the legacy lane run."""
+    return _AssembledBlock(fired=False, shape=None, subjects=(),
+                           slices={}, admission={}, post_cap_lines=[])
+
+
+def _assemble_relative_date(sdk, question: str, *, question_date: str | None,
+                            caps: dict) -> _AssembledBlock:
+    """#2655 — the calendar-anchored day lookup (the RELATIVE_DATE branch).
+
+    anchor (resolved against the caller's ``question_date`` through the SHARED
+    ``_norm_date`` — one date source, never a clock read here) -> one batched
+    equality-day walk -> the day's own block. An unresolvable anchor, an
+    ambiguous anchor set, or a day with NO rows all fall through to legacy
+    byte-identically (P1-1: firing a bare dateline would REPLACE a working
+    legacy pool and burn the one reader call).
+
+    The tail is the SHARED one (`_decorate_real_rows` + `_assemble_under_caps`,
+    the same helpers the #2652 window path uses), so the decorate/D8/W4/
+    assemble stages have exactly one implementation.
+    """
+    from tortoise.retrieval import resolve_limit_from_caps
+    limit = resolve_limit_from_caps(caps)
+    anchor = resolve_calendar_anchor(question, _norm_date(question_date))
+    if anchor is None:
+        return _empty_block()
+    slices = collect_day_slices(docker_walker_port(sdk), anchor.days,
+                                per_day_cap=limit)
+    if not slices.timeline_rows:
+        return _empty_block()
+    hits = synthesize_hits(slices, shape=AssemblyShape.RELATIVE_DATE,
+                           date_anchor=anchor)
+    hits = _decorate_real_rows(sdk, hits)
+    selected, cap_stats = _assemble_under_caps(
+        hits, caps=caps, question_date=question_date)
+    if not selected:
+        # P1-1: a day whose rows all fall outside the caps would replace a
+        # working legacy pool with a dateline — fall through to legacy.
+        return _empty_block()
+    # the day IS the scope: no resolved subject rides on the block.
+    return _AssembledBlock(
+        fired=True, shape=AssemblyShape.RELATIVE_DATE.value, subjects=(),
+        slices={"state_rows": [],
+                "timeline_rows": list(slices.timeline_rows),
+                "evidence_rows": list(slices.evidence_rows)},
+        admission=dict(slices.admission), post_cap_lines=selected,
+        cap_stats=cap_stats)
+
+
 def _assemble_connected(sdk, question: str, *, question_date: str | None = None,
                         caps: dict | None = None) -> _AssembledBlock:
     """The fired content pipeline (env-gated at the CALLER —
@@ -2854,6 +3188,12 @@ def _assemble_connected(sdk, question: str, *, question_date: str | None = None,
     if shape is None:
         return _AssembledBlock(fired=False, shape=None, subjects=(),
                                slices={}, admission={}, post_cap_lines=[])
+    if shape is AssemblyShape.RELATIVE_DATE:
+        # #2655: the DAY is the scope — there is no subject to resolve, so the
+        # resolver/both-halves gate does not apply and the subject pipeline
+        # below is entered UNCHANGED for every other shape.
+        return _assemble_relative_date(sdk, question,
+                                       question_date=question_date, caps=caps)
     if shape is AssemblyShape.AGO_RELATIVE:
         # #2652: the selector is the TIME WINDOW (question_date minus the
         # parsed offset), not an Object — so the R1 both-halves gate is
@@ -2929,13 +3269,12 @@ def _assemble_connected(sdk, question: str, *, question_date: str | None = None,
     selected, cap_stats = _assemble_under_caps(
         hits, caps=caps, question_date=question_date)
     if not selected:
-        # P1-1: both halves resolved but the assembly has NOTHING to say
-        # (content-less subjects) — firing would replace legacy evidence
-        # with an empty block and burn the ONE reader call on nothing.
-        # Fall through to legacy (the R1 spirit: fire only when the fired
-        # block is a REAL replacement).
-        return _AssembledBlock(fired=False, shape=None, subjects=(),
-                               slices={}, admission={}, post_cap_lines=[])
+        # P1-1: the assembly has NOTHING to say (content-less subjects, or an
+        # empty day) — firing would replace legacy evidence with an empty
+        # block and burn the ONE reader call on nothing. Fall through to
+        # legacy (the R1 spirit: fire only when the fired block is a REAL
+        # replacement).
+        return _empty_block()
     subs = [{"object_id": c.object_id, "name": c.name,
              "confidence": c.confidence}
             for c in candidates]
