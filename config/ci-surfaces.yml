@@ -2019,6 +2019,21 @@ surfaces:
   # `tests/test_ci_selection.py::test_queue_resweep_tool_change_selects_core_not_tier1`.
   # Hermetic: every GitHub surface is a fake (no `gh`, no network, no Mergify).
   - test_queue_resweep.py
+  # #5971: the e2e-live DETECTOR (graph-scripts/e2e_live_reconcile.py) and its
+  # REMEDIATOR (graph-scripts/2146_e2e_live_orphan_cleanup.py) must scope the same
+  # namespace — the guard shape, plus the residue the guard excludes. `core` owns
+  # it: neither file matches a SOURCE_PATTERNS entry, so both select `core` via
+  # the `graph-scripts/` fallback (the same placement argument as the test_2500_*
+  # pinner; `graph-scripts/` itself is a fallback tree, though individual files in
+  # it are named — e.g. `graph-scripts/backfill_embeddings.py` selects `eval`).
+  # Measured on this diff:
+  # `select(["graph-scripts/2146_e2e_live_orphan_cleanup.py"])` returns the `core`
+  # surface (its full file set), which includes this file — the registration is
+  # what keeps the guard CLASSIFIED (manifest-integrity) and selected on any
+  # `core`-matched change. (A full-matrix answer is the unknown-path/push/schedule
+  # branch, not this one.)
+  # DB-free — every driver is a fake runner.
+  - test_e2e_live_reconcile_scope_parity.py
   ep:
   # #2884 D3: the EP/dream belief-state journal+replay guard. `tortoise/dream.py`
   # selects `ep`, so this registration is what runs the guard on a dream.py
