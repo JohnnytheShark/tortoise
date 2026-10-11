@@ -53,6 +53,8 @@ from .ids import ulid
 from .live import TERMINAL_EXCLUDED_STATUSES  # EP terminal vocabulary (shared)
 from .live import _live_only  # #6597 dream coverage closure mirrors EP liveness
 from .live import decay_clause, _terminal_excluded  # #2490 vacuity decay + terminal predicate
+from .live import epistemic_label_queries  # #7853 epistemic-label id sweep
+from .live import epistemic_disjunction  # #7853 epistemic-label traversal clause
 from .entity_identity import (  # #3633 route-then-refuse identity resolution
     ADDRESSING_SOURCE, resolve_document_target_id, resolve_entity_id)
 from .live import _terminal_expression  # #3142 shared Cypher terminal predicate (POSITIVE direction)
@@ -3456,13 +3458,28 @@ def _apply_capture_ingest_ep(sdk, claim_ids: list[str], *,
         # FOLDED claim must go live or that claim's first calibration cannot
         # propagate through it — and a folded-only capture mints no claim,
         # so promotion_ids is empty and the claim join alone reaches nothing.
-        op_rows = proj.g.query(
-            "MATCH (o:Point {is_operator:true})-[:IMPL|NAND]->(c:Point) "
+        op_rows: list = []
+        _seen_op_ids: set = set()
+        # #7853: c is id-anchored — sweep the epistemic labels so an operator
+        # whose live endpoint is an Event/Subject/Object is promoted too. A
+        # multi-labelled endpoint (``:Point:Object``) matches MORE than one
+        # sweep, so collapse on ``o.id`` before the emit loop: the promoted
+        # set must equal the journalled set (#395), and the loop below emits
+        # one ``OperatorPromoted`` per row. The ``o.id IN $op_ids`` arm keeps
+        # #1088's created-operator promotion inside this same sweep, so a
+        # capture-minted operator over a FOLDED claim still goes live.
+        for _q in epistemic_label_queries(
+            "MATCH (o:Point {is_operator:true})-[:IMPL|NAND]->(c:{label}) "
             "WHERE (c.id IN $ids OR o.id IN $op_ids) "
             "AND (o.status IS NULL OR o.status = 'draft') "
-            "RETURN DISTINCT o.id",
-            params={"ids": promote_ids, "op_ids": operator_ids},
-        ).result_set
+            "RETURN DISTINCT o.id"
+        ):
+            for row in proj.g.query(
+                    _q, params={"ids": promote_ids,
+                                "op_ids": operator_ids}).result_set:
+                if row[0] not in _seen_op_ids:
+                    _seen_op_ids.add(row[0])
+                    op_rows.append(row)
         promoted_ops = []
         for (oid,) in op_rows:
             proj.g.query(
@@ -6765,19 +6782,23 @@ class TortoiseSDK:
                     # journal record; OperatorPromoted is its only durable
                     # record).
                     if minted_ids:
-                        proj.g.query(
+                        # #7853: c is id-anchored — sweep the epistemic labels.
+                        # The SET is idempotent, so a multi-labelled endpoint is
+                        # stamped under each matching label harmlessly.
+                        for _q in epistemic_label_queries(
                             "MATCH (o:Point {is_operator:true})-"
-                            "[:IMPL|NAND]->(c:Point) "
+                            "[:IMPL|NAND]->(c:{label}) "
                             "WHERE c.id IN $ids "
                             "AND (o.status IS NULL OR o.status = 'draft') "
                             "AND o.eventId IS NULL "
                             "SET o.eventId=$eid, o.source_session=$sid, "
                             "    o.source_harness=$harness, "
-                            "    o.ingested_at=$ing",
-                            params={"ids": minted_ids,
-                                    "eid": event_id, "sid": session_id,
-                                    "harness": source_harness, "ing": now},
-                        )
+                            "    o.ingested_at=$ing"
+                        ):
+                            proj.g.query(_q, params={
+                                "ids": minted_ids,
+                                "eid": event_id, "sid": session_id,
+                                "harness": source_harness, "ing": now})
                     # #4936: the minted-point join above CANNOT reach an
                     # operator whose endpoint RE-KEYED to a pre-existing
                     # graph node (#4716 Part 1): the payload point resolved
@@ -9892,21 +9913,30 @@ class TortoiseSDK:
 
         An operator is promoted only when it carries EXPLICIT status 'draft'
         (the post-#780 `create_operator(promote_source=False)` shape) AND
-        every endpoint Point is live — otherwise the draft endpoints would
-        inherit a live edge (the exact pollution the draft lifecycle
-        prevents). Unset-status operators are LIVE under the canonical read
-        model (projection coalesce default; #944 review) and are skipped —
-        never re-promoted into the event stream.
+        every endpoint is live — otherwise a draft endpoint would inherit a
+        live edge (the exact pollution the draft lifecycle prevents). The
+        endpoint read is NOT Point-only: #7853 widened it to
+        `epistemic_disjunction('s')`, so it covers all four epistemic labels
+        (`Point`, `Subject`, `Object`, `Event`) and a draft `:Event` endpoint
+        blocks promotion just as a draft `:Point` does. Unset-status operators
+        are LIVE under the canonical read model (projection coalesce default;
+        #944 review) and are skipped — never re-promoted into the event
+        stream.
         """
-        rows = proj.g.query(
-            "MATCH (o:Point {is_operator:true})-[r]->(n:Point {id:$id}) "
-            "WHERE o.status = 'draft' RETURN DISTINCT o.id",
-            params={"id": point_id},
-        ).result_set
+        rows: list = []
+        # #7853: n is id-anchored — sweep the epistemic labels so a draft
+        # operator incident to an Event/Subject/Object endpoint is promoted.
+        for _q in epistemic_label_queries(
+            "MATCH (o:Point {is_operator:true})-[r]->(n:{label} {id:$id}) "
+            "WHERE o.status = 'draft' RETURN DISTINCT o.id"
+        ):
+            rows.extend(proj.g.query(
+                _q, params={"id": point_id}).result_set)
         promoted = []
         for (oid,) in rows:
             eps = proj.g.query(
-                "MATCH (o:Point {id:$oid})-[r]->(s:Point) "
+                "MATCH (o:Point {id:$oid})-[r]->(s) "
+                f"WHERE {epistemic_disjunction('s')} "
                 "RETURN s.id, s.status",
                 params={"oid": oid},
             ).result_set
@@ -15641,7 +15671,12 @@ class TortoiseSDK:
 
         Mirrors ``TortoiseEP._affected_claims``'s reach so that
         ``affected ⊆ closure`` holds and ``coverage <= 1.0`` for EVERY pass
-        (#6597). The window members themselves are reachable at 0 claim-hops
+        (#6597). #7853: the reach is widened with ``_affected_claims`` — the
+        id-anchored seeds sweep every epistemic label and the operator hop's
+        far endpoint is a label-disjunction, so a non-`:Point` operator input
+        is in the denominator too. The operator-less DIRECT-edge hop stays
+        ``:Point``→``:Point``, exactly as ``_affected_claims`` keeps it. The
+        window members themselves are reachable at 0 claim-hops
         (an operator-less isolated claim is its own window); then, exactly as
         ``_affected_claims`` seeds its own expansion, the plain window
         members are expanded by ONE claim-hop (direct edges + operator
@@ -15670,12 +15705,18 @@ class TortoiseSDK:
         # terminal window claims must remain seeds so the operator siblings
         # `_affected_claims._live_neighbors` reaches stay in the closure.
         live = "(n.status IS NULL OR n.status <> 'draft')"
-        rows = proj.g.query(
-            "MATCH (n:Point) WHERE n.id IN $ids "
+        # #7853: the seed is ID-ANCHORED — sweep the epistemic labels so a
+        # non-`:Point` window member is a closure seed too. The widened
+        # `_affected_claims` admits one, so the denominator must, or
+        # `coverage = affected / closure` exceeds the 1.0 bound.
+        rows: list = []
+        for _qn in epistemic_label_queries(
+            "MATCH (n:{label}) WHERE n.id IN $ids "
             "AND (n.is_operator IS NULL OR n.is_operator = false) "
-            f"AND {live} RETURN n.id",
-            params={"ids": list(window)},
-        ).result_set
+            f"AND {live} RETURN n.id"
+        ):
+            rows.extend(proj.g.query(
+                _qn, params={"ids": list(window)}).result_set)
         closure: set[str] = {r[0] for r in rows}
 
         live_op = _live_only("op.status")
@@ -15698,15 +15739,22 @@ class TortoiseSDK:
             new_frontier: list[str] = []
             if not frontier:
                 return new_frontier
-            nbr_rows = proj.g.query(
-                "MATCH (n:Point)<-[r:IMPL|NAND]-(op:Point)"
-                "-[r2:IMPL|NAND]->(m:Point) "
+            # #7853: n is the id-anchored frontier — sweep its labels; the
+            # far endpoint m is widened by traversal. Mirrors
+            # `_affected_claims`'s widened operator hop, so the closure can
+            # hold every claim the pass admits.
+            nbr_rows: list = []
+            for _qn in epistemic_label_queries(
+                "MATCH (n:{label})<-[r:IMPL|NAND]-(op:Point)"
+                "-[r2:IMPL|NAND]->(m) "
                 "WHERE n.id IN $ids AND m.id <> n.id "
+                f"AND {epistemic_disjunction('m')} "
                 "AND (op.is_operator = true OR op.op_type IS NOT NULL) "
                 f"AND {live_op} AND {live_m} "
-                "RETURN DISTINCT n.id, m.id",
-                params={"ids": frontier},
-            ).result_set
+                "RETURN DISTINCT n.id, m.id"
+            ):
+                nbr_rows.extend(proj.g.query(
+                    _qn, params={"ids": frontier}).result_set)
             for _nid, mid in nbr_rows:
                 if mid not in closure:
                     closure.add(mid)
@@ -15744,9 +15792,13 @@ class TortoiseSDK:
         # denominator bug reached through the SEED rather than the hop. Mirrors
         # `_affected_claims`'s operator-seed branch, which admits an operator
         # seed's outgoing `IMPL|NAND` targets.
+        # #7853: an operator's INPUT may be any epistemic label (mirrors
+        # `_affected_claims`'s operator-seed branch, which admits a non-Point
+        # operator target).
         op_input_rows = proj.g.query(
-            "MATCH (o:Point)-[r:IMPL|NAND]->(c:Point) "
+            "MATCH (o:Point)-[r:IMPL|NAND]->(c) "
             "WHERE o.id IN $ids "
+            f"AND {epistemic_disjunction('c')} "
             "AND (o.is_operator = true OR o.op_type IS NOT NULL) "
             f"AND {live_o} AND {live_c} "
             "RETURN DISTINCT c.id",
@@ -15794,9 +15846,14 @@ class TortoiseSDK:
         converged pass reports coverage < 1.0 forever).
         """
         proj = self._get_proj()
+        # #7853: the EP-run universe widened to every epistemic label, so
+        # this denominator must too — else `coverage = total_affected /
+        # reachable` exceeds 1.0 for a non-`:Point` operator input.
         rows = proj.g.query(
-            "MATCH (n:Point)-[r:IMPL|NAND]-(m:Point) "
-            "WHERE (n.is_operator IS NULL OR n.is_operator = false) "
+            "MATCH (n)-[r:IMPL|NAND]-(m) "
+            f"WHERE {epistemic_disjunction('n')} "
+            f"AND {epistemic_disjunction('m')} "
+            "AND (n.is_operator IS NULL OR n.is_operator = false) "
             "AND (n.status IS NULL OR n.status <> 'draft') "
             "AND (m.status IS NULL OR m.status <> 'draft') "
             "RETURN count(DISTINCT n)"
@@ -15998,12 +16055,23 @@ class TortoiseSDK:
         if confidences:
             params_list = [{"id": cid, "c": conf["mean"]}
                            for cid, conf in confidences.items()]
-            written = proj.g.query(
-                "UNWIND $params AS p "
-                "MATCH (n:Point {id: p.id}) SET n.confidence = p.c "
-                "RETURN n.id",
-                params={"params": params_list},
-            ).result_set
+            # #7853: the run set spans all four epistemic labels, so sweep ONE
+            # query per label to keep the id index-anchored (a label predicate
+            # over the UNWIND drops the per-(label, property) anchor —
+            # ``tortoise/live.py``). A multi-labelled node (``:Point:Object``)
+            # is returned by more than one sweep, so collapse on id: the
+            # journal set must equal the committed set (#395).
+            written: list = []
+            seen_ids: set = set()
+            for _q in epistemic_label_queries(
+                    "UNWIND $params AS p "
+                    "MATCH (n:{label} {id: p.id}) SET n.confidence = p.c "
+                    "RETURN n.id"):
+                for row in proj.g.query(
+                        _q, params={"params": params_list}).result_set:
+                    if row[0] not in seen_ids:
+                        seen_ids.add(row[0])
+                        written.append(row)
             # #2884 D3: this full-precision mean is the last confidence
             # writer on the fast path (the EP flush already journaled its
             # 4-dp rounded mirror) — journal it too, or a rebuild loses the
@@ -26610,8 +26678,13 @@ class TortoiseSDK:
                     "outcomes": []}
         match_clause = "s.id = $sid"
 
-        # Direct: Event connects directly to claim Points via IMPL/NAND
-        # (Operators connect ONLY epistemic targets per ONTOLOGY: Event→Point, Point→Point)
+        # Direct: Event connects directly to claim Points via IMPL/NAND.
+        # ONTOLOGY.md §8: operators connect only epistemic targets
+        # (:Point/:Subject/:Object/:Event). ⚠️ this reader is still
+        # `:Point`-only — the #7853 read widening covers the EP/confidence
+        # path, not reputation; widening it to the other three labels is
+        # tracked by #7902 (the write path admits :Point/:Event only until
+        # then, so a :Subject/:Object endpoint is spec-only here too).
         impl_rows = proj.g.query(
             "MATCH (s:Subject)-[:performs]->(e:Event) "
             "MATCH (e)-[:IMPL]->(p:Point) "
