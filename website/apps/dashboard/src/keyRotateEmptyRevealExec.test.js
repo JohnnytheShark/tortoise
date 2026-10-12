@@ -46,10 +46,18 @@ import { readFileSync } from 'node:fs'
 import { dirname, join } from 'node:path'
 import { fileURLToPath } from 'node:url'
 import { stripComments } from './testSupport.js'
+// #4370 (A6): the REAL predicate, imported from its module-scope home in the
+// pure module — not a copy extracted out of main.jsx. `main.jsx` now IMPORTS it
+// too, so a test that extracted a local declaration would fail loudly rather
+// than silently stop guarding the seams.
+import { revealablePlaintext, revealableMintPlaintext } from './sessionKey.js'
 
 const here = dirname(fileURLToPath(import.meta.url))
 const mainJsx = readFileSync(join(here, 'main.jsx'), 'utf8')
 const mainJsxCode = stripComments(mainJsx)
+// #4370 (A6): the predicate's body now lives here, so the static pin reads it
+// from its real home instead of a copy inside `main.jsx`.
+const sessionKeyJs = readFileSync(join(here, 'sessionKey.js'), 'utf8')
 
 // ── token-aware extraction of a real declaration from main.jsx ──────────────
 // Strings, template literals and comments are skipped so a brace inside copy
@@ -160,6 +168,11 @@ function rotateEnv({ response, reject, loadAll, orgIdRef, apiImpl, lifetimeDays 
     wizardDurableKey: '',
     team: { tier: 'free' },
     _MS_PER_DAY: 86400000,
+    // #4370 (A6): the REAL shared predicate + refusal builder, imported/extracted
+    // rather than stubbed — a stub here would verify the stub (the repo's
+    // "real helper, not a copy" standard).
+    revealablePlaintext,
+    revealableMintPlaintext,
     // Pure helpers — irrelevant to the plaintext guard; stubs keep the file
     // free of their own dependencies.
     lifetimeDaysFromRow: () => (lifetimeDays === undefined ? null : lifetimeDays),
@@ -195,7 +208,7 @@ function rotateEnv({ response, reject, loadAll, orgIdRef, apiImpl, lifetimeDays 
     setWelcomeKey: (v) => calls.welcomeKeys.push(v),
     setWizardDurableKey: (v) => calls.wizardKeys.push(v),
   }
-  return { deps, calls, regenerateKey: build(deps, ['function revealablePlaintext', 'function revealableMintPlaintext', 'async function regenerateKey']).regenerateKey }
+  return { deps, calls, regenerateKey: build(deps, ['function revealRefusalFor', 'async function regenerateKey']).regenerateKey }
 }
 
 test('#4342: a plaintext-less rotate 2xx latches NO reveal and states the old key is revoked', async () => {
@@ -451,8 +464,7 @@ test('#4355: rotating a row whose prefix we hold clears the held plaintext (row 
   const env = rotateEnv({ response: { key: 'tt_ok', replaced_revoked: true } })
   env.deps.welcomeKey = 'tt_live_re_abc'
   env.deps.wizardDurableKey = 'tt_other'
-  const fn = build(env.deps,
-    ['function revealablePlaintext', 'function revealableMintPlaintext', 'async function regenerateKey']).regenerateKey
+  const fn = build(env.deps, ['function revealRefusalFor', 'async function regenerateKey']).regenerateKey
   await fn('k-old')
   assert.deepEqual(env.calls.welcomeKeys, [''],
     'the welcome plaintext belonging to the rotated row is cleared')
@@ -536,8 +548,9 @@ test('#4429: the two outcome readers never surface another team\u2019s record', 
   // (main.jsx\u2019s, reproduced verbatim) read only through it.
   const rec = { plaintext: 'tt_rot_kept', expiresAt: '2026-10-20T00:00:00+00:00', warning: 'both keys are live' }
   const outcomes = { 'org-A': rec }
-  const { revealablePlaintext, rotateOutcomeFor } = build({},
-    ['function revealablePlaintext', 'function rotateOutcomeFor'])
+  // #4370 (A6): `revealablePlaintext` is imported at module scope now, so only
+  // `rotateOutcomeFor` is extracted from `main.jsx`.
+  const { rotateOutcomeFor } = build({}, ['function rotateOutcomeFor'])
   const revealOf = (orgId) => {
     const o = rotateOutcomeFor(outcomes, orgId)
     return (o && revealablePlaintext(o.plaintext)) || ''
@@ -572,6 +585,7 @@ function copyEnv(outcome, clipboard = {}) {
   const deps = {
     rotateOutcome: outcome,
     currentOrgId: 'org-A',
+    revealablePlaintext,
     navigator: {
       clipboard: {
         writeText: async (v) => { written.push(v); return (clipboard.writeText || (async () => {}))(v) },
@@ -592,7 +606,7 @@ function copyEnv(outcome, clipboard = {}) {
       cleared.push(outcomesState)
     },
   }
-  return { written, cleared, selected, fakeEl, copyRotatedKey: build(deps, ['function revealablePlaintext', 'async function copyRotatedKey']).copyRotatedKey }
+  return { written, cleared, selected, fakeEl, copyRotatedKey: build(deps, ['async function copyRotatedKey']).copyRotatedKey }
 }
 
 test('#4342: the rotate copy NEVER hands a non-string/empty value to the clipboard', async () => {
@@ -654,9 +668,14 @@ test('#4342/#4429: the rotate reveal is gated on a derived non-empty string, and
   assert.match(mainJsxCode,
     /const rotateNoticeText = \(rotateOutcome && rotateOutcome\.warning\) \|\| ''/,
     'the partial-state notice must render from the same team-scoped record (#4429)')
-  assert.match(mainJsxCode,
-    /function revealablePlaintext\(value\) \{\s*return \(typeof value === 'string' && value\.replace\([^\n]*\)\.trim\(\)\) \? value : ''/,
+  // #4370 (A6): the predicate moved to module scope in the pure module, so the
+  // body pin follows it there (it is no longer declared in main.jsx).
+  assert.match(sessionKeyJs,
+    /export function revealablePlaintext\(value\) \{\s*return \(typeof value === 'string' && value\.replace\([^\n]*\)\.trim\(\)\) \? value : ''/,
     'the shared predicate must reject a blank (including zero-width/invisible) string, not just a falsy one')
+  assert.match(mainJsxCode,
+    /import \{[^}]*revealablePlaintext[^}]*\} from '\.\/sessionKey\.js'/,
+    'main.jsx must import the shared predicate from its module-scope home')
   assert.match(mainJsxCode, /\{rotatedKeyReveal && \(/,
     'the JSX must gate on the derived string, not the truthy object')
   assert.match(mainJsxCode, /\{rotateNoticeText && \(/,
