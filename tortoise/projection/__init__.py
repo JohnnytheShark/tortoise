@@ -14063,13 +14063,14 @@ class FalkorProjection(
                     params["embedding"] = emb  # None = wipe stale embedding for empty content
                 except Exception:
                     params["embedding"] = None  # wipe stale embedding on failure (#19)
-                # #4521: cast with `vecf32()` like every other Point embedding
-                # writer. Without it the recomputed vector landed as a plain
-                # Cypher `List`, and `vec.euclideanDistance` — search_engine's
-                # per-row dense leg — raises "Type mismatch: expected Null or
-                # Vectorf32 but was List", aborting the WHOLE query. So ONE
-                # revised node degraded the entire Point dense leg to FTS-only
-                # recall for that graph, not just its own row. The `CASE` keeps
+                # #4521: cast with `vecf32()` like every other server-owned Point
+                # embedding writer, so a server-owned vector is always the typed shape —
+                # a bare `List` node is absent from the Point HNSW index at all
+                # (#8429). Before #8316 the flip to `List` also aborted the
+                # whole dense READ (`Type mismatch: expected Null or Vectorf32
+                # but was List`); the read boundary now normalises a right-width
+                # `List`, so only a wrong width or a non-numeric value still
+                # aborts the MATCH (#8430). The `CASE` keeps
                 # this clause's existing wipe-on-None semantics (`$embedding` is
                 # None for empty content and on encoder failure) while casting
                 # every real vector — `vecf32(NULL)` is not relied upon.
@@ -14284,7 +14285,7 @@ class FalkorProjection(
             # The clause is the SAME `SET n += $s` the live write ran, on the
             # SAME map — so live and replay cannot disagree on removals or on
             # value typing (a `properties(n)` snapshot would: a removed key is
-            # absent from it, and a VectorF32 comes back as a plain list).
+            # absent from it, and a Vectorf32 comes back as a plain list).
             if not isinstance(rid, str):
                 return 0                                   # #331 parity
             if not (isinstance(label, str) and label in _CANONICAL_ENTITY_LABELS):
