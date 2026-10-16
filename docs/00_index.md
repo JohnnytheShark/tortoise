@@ -11,12 +11,12 @@ aboutObjects: tortoise
 
 # Documentation Index
 
-This documentation index is organized according to the **[Diátaxis framework](https://diataxis.fr/)** across four living documentation quadrants (**Tutorials**, **How-To Guides**, **Reference**, **Explanation**), followed by the **Engineering & Fleet Ledger** for point-in-time issue scoping, implementation plans, runbooks, and empirical evidence.
+This documentation index is organized according to the **[Diátaxis framework](https://diataxis.fr/)** across four living documentation subdirectories (**[`docs/tutorials/`](tutorials/index.md)**, **[`docs/how-to/`](how-to/index.md)**, **[`docs/reference/`](reference/index.md)**, **[`docs/explanation/`](explanation/index.md)**), followed by the **Engineering & Fleet Ledger** for point-in-time issue scoping, implementation plans, runbooks, and empirical evidence.
 
-- [1. Tutorials (Learning-Oriented)](#1-tutorials-learning-oriented)
-- [2. How-To Guides (Task-Oriented)](#2-how-to-guides-task-oriented)
-- [3. Reference (Information-Oriented)](#3-reference-information-oriented)
-- [4. Explanation (Understanding-Oriented)](#4-explanation-understanding-oriented)
+- [1. Tutorials (Learning-Oriented)](#1-tutorials-learning-oriented) — [`docs/tutorials/index.md`](tutorials/index.md)
+- [2. How-To Guides (Task-Oriented)](#2-how-to-guides-task-oriented) — [`docs/how-to/index.md`](how-to/index.md)
+- [3. Reference (Information-Oriented)](#3-reference-information-oriented) — [`docs/reference/index.md`](reference/index.md)
+- [4. Explanation (Understanding-Oriented)](#4-explanation-understanding-oriented) — [`docs/explanation/index.md`](explanation/index.md)
 - [5. Engineering & Fleet Ledger (Scoping, Plans, Runbooks & Evidence)](#5-engineering--fleet-ledger-scoping-plans-runbooks--evidence)
 
 ---
