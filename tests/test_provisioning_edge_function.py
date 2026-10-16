@@ -300,6 +300,230 @@ def test_edge_function_allowlists_welcome_page_origins():
     assert re.search(r"LOCAL_ORIGIN_RE", src), "LOCAL_ORIGIN_RE must exist"
 
 
+def _allowlist_pattern(const: str) -> re.Pattern[str]:
+    # Anchors the declaration and captures its opening bracket. The BODY is taken
+    # by `_array_body`, not by a regex: `\[([^\]]*)\]` stops at the first `]` in
+    # the file, so a `]` inside a host string (an IPv6 origin such as
+    # `https://[::1]:1`) truncated the compared value and hid every host after it
+    # — measured: a drifted host placed after such an entry passed. The optional
+    # opening paren accepts a parenthesised literal (`= ([...] as const)`), which
+    # is a literal the sweep must compare rather than report as absent.
+    return re.compile(
+        rf"(?:export\s+)?(?:const|let|var)\s+{const}\s*(?::[^=\n]+)?=\s*\(?\s*(\[)"
+    )
+
+
+def _array_body(code: str, open_idx: int) -> str | None:
+    """The text between the `[` at `open_idx` and its matching `]`.
+
+    String-aware and depth-aware: a `]` inside a quoted host does not end the
+    array, and an array of arrays is captured whole. `None` when the bracket is
+    never closed — the caller then has a declaration it cannot read, which is a
+    RED, not a silence.
+    """
+    if open_idx >= len(code) or code[open_idx] != "[":
+        return None
+    depth = 0
+    quote: str | None = None
+    i = open_idx
+    while i < len(code):
+        ch = code[i]
+        if quote:
+            if ch == "\\":
+                i += 2
+                continue
+            if ch == quote:
+                quote = None
+            i += 1
+            continue
+        if ch in "\"'`":
+            quote = ch
+            i += 1
+            continue
+        if ch == "[":
+            depth += 1
+        elif ch == "]":
+            depth -= 1
+            if depth == 0:
+                return code[open_idx + 1:i]
+        i += 1
+    return None
+
+
+def _normalise_array_body(body: str) -> str:
+    """The body's elements, with whitespace and separators folded away.
+
+    Commas carry no meaning for a comparison of hosts, and folding them matters:
+    a comment removed from inside the array leaves its separating comma behind, so
+    comparing raw bodies would make a comment-only edit to one file look like
+    drift. A comma inside a host string is folded on both sides alike, so the
+    comparison is unaffected.
+    """
+    return re.sub(r"[\s,]+", " ", body).strip()
+
+
+def _allowlist_arrays(code: str, const: str) -> list[str]:
+    """Every array-literal body declared for `const`, normalised.
+
+    `code` must already be comment-stripped: the compared values ARE URLs, so a
+    comment removed by regex would collapse them.
+    """
+    pat = _allowlist_pattern(const)
+    bodies = []
+    for match in pat.finditer(code):
+        body = _array_body(code, match.start(1))
+        if body is not None:
+            bodies.append(_normalise_array_body(body))
+    return bodies
+
+def _strip_ts_comments(text: str) -> str:
+    """The file's code, with block and line comments removed.
+
+    String-aware on purpose: the values being compared ARE URLs, so removing
+    every `//` to end-of-line would collapse all four hosts to `"https:` and
+    make three drifted files compare EQUAL (measured). Quotes are tracked, so
+    `//` inside a string survives and only real comments go. Comments are
+    removed rather than skipped so a literal inside a comment can neither
+    satisfy the comparison nor break it, and a declaration sharing a line with
+    a block comment is still examined.
+    """
+    out: list[str] = []
+    i, n = 0, len(text)
+    quote: str | None = None
+    while i < n:
+        ch = text[i]
+        if quote:
+            out.append(ch)
+            if ch == "\\" and i + 1 < n:
+                out.append(text[i + 1])
+                i += 2
+                continue
+            if ch == quote:
+                quote = None
+            i += 1
+            continue
+        if ch in "\"'`":
+            quote = ch
+            out.append(ch)
+            i += 1
+            continue
+        if text.startswith("//", i):
+            nxt = text.find("\n", i)
+            i = n if nxt < 0 else nxt
+            continue
+        if text.startswith("/*", i):
+            end = text.find("*/", i + 2)
+            i = n if end < 0 else end + 2
+            out.append(" ")
+            continue
+        out.append(ch)
+        i += 1
+    return "".join(out)
+
+def _unreadable_allowlist_declarations(code: str, const: str) -> list[str]:
+    """A declaration of `const` whose right-hand side is not an array literal.
+
+    Reading literals alone cannot see a wrapped or imported value, so a file
+    could serve `Object.freeze([...])` or `makeOrigins()` while a commented
+    literal satisfied the comparison — measured GREEN with a comment copy of
+    the reference beside a served non-literal. A declaration the sweep cannot
+    read is a RED, not a gap.
+
+    Comments are stripped, not skipped, and the search spans the whole text:
+    skipping a line left `/* <reference> */ const NAME = makeOrigins();` on
+    one line entirely unexamined (measured GREEN, served value a call), while
+    deciding per line made `const NAME =` followed by the array on the NEXT
+    line a false RED whose remedy ("make it an array literal") was already
+    satisfied. Stripping spans and searching the whole text handles both, and
+    still clears the two false REDs that a raw-text match produced: a
+    commented `// let NAME = makeOrigins();` and a JSDoc `@example`. A
+    parenthesised literal (`= ([...] as const)`) and one broken after `=` are
+    both read as the literals they are.
+    """
+    pat = re.compile(
+        rf"(?:export\s+)?(?:const|let|var)\s+{const}\s*(?::[^=\n]+)?=(?!\s*\(*\s*\[)"
+    )
+    out: list[str] = []
+    for hit in pat.finditer(code):
+        fragment = " ".join(code[hit.start():hit.end() + 40].split())
+        out.append(fragment[:80])
+    return out
+
+
+def test_allowlist_declaration_scan_reads_code_not_text():
+    """The scan's contract, pinned on snippets.
+
+    Three review cycles found this helper wrong in three different ways: it read
+    only the FIRST declaration (a decoy could stand in for a drifted array), then
+    it matched raw text (a commented example became a false RED while a decoy
+    satisfied the comparison), then it decided per line (a literal whose bracket
+    wrapped to the next line was refused, and a declaration sharing its line with
+    a block comment was never examined). Each case below is one of those.
+    """
+    ref = _allowlist_pattern("ALLOWED_ORIGINS")
+    literal = 'const ALLOWED_ORIGINS = [\n  "https://premiselabs.co",\n];'
+    assert ref.search(literal), "a literal declaration must be read"
+    # The compared values ARE URLs: comment stripping must not touch a `//` that
+    # lives inside a string, or every host collapses and drifted files compare equal.
+    assert _strip_ts_comments(literal).count("https://premiselabs.co") == 1
+    assert not _unreadable_allowlist_declarations(
+        _strip_ts_comments(literal), "ALLOWED_ORIGINS"
+    )
+    # A declaration the scan cannot READ is a RED, wherever the decoy sits.
+    for bad in (
+        "const ALLOWED_ORIGINS = makeOrigins();",
+        "const ALLOWED_ORIGINS = Object.freeze([\n  \"https://a\",\n]);",
+        '/* const ALLOWED_ORIGINS = ["https://a"]; */ const ALLOWED_ORIGINS = makeOrigins();',
+    ):
+        assert _unreadable_allowlist_declarations(
+            _strip_ts_comments(bad), "ALLOWED_ORIGINS"
+        ), bad
+    # Neither a comment nor a line break may be read as a fault.
+    for good in (
+        "// let ALLOWED_ORIGINS = makeOrigins();\n" + literal,
+        "/** @example const ALLOWED_ORIGINS = build(); */\n" + literal,
+        "// previously: [\"https://old.example\"]\n" + literal,
+        'const ALLOWED_ORIGINS =\n  ["https://a"];',
+        'const ALLOWED_ORIGINS = (["https://a"] as const);',
+        'const ALLOWED_ORIGINS: string[] = ["https://a"];',
+    ):
+        code = _strip_ts_comments(good)
+        assert not _unreadable_allowlist_declarations(code, "ALLOWED_ORIGINS"), good
+        assert ref.search(code), good
+    # The captured VALUE must be the whole array, not the prefix before the first
+    # `]` in the file. A `]` inside a quoted host (an IPv6 origin) or in a nested
+    # array used to truncate it — measured: at `[^\]]*` a drift placed after such
+    # an entry passed the parity check while the served value had changed.
+    for src, expected in (
+        (
+            'const ALLOWED_ORIGINS = ["https://[::1]:1", "https://tortoise.premiselabs.co"];',
+            '"https://[::1]:1" "https://tortoise.premiselabs.co"',
+        ),
+        (
+            'const ALLOWED_ORIGINS = [["https://a"], ["https://b"]];',
+            '["https://a"] ["https://b"]',
+        ),
+        (
+            'const ALLOWED_ORIGINS = ["https://a//b", "https://c"];',
+            '"https://a//b" "https://c"',
+        ),
+    ):
+        stripped = _strip_ts_comments(src)
+        assert _allowlist_arrays(stripped, "ALLOWED_ORIGINS") == [expected], src
+    # An unterminated array is a declaration the scan cannot read, never a silence.
+    assert (
+        _allowlist_arrays('const ALLOWED_ORIGINS = ["https://a";', "ALLOWED_ORIGINS")
+        == []
+    )
+    # A comment inside the REFERENCE array must not red an honest change either:
+    # the reference is stripped like every scanned file — and the comma its removal
+    # leaves behind must not be read as drift by the comparison.
+    ref_src = 'const ALLOWED_ORIGINS = [\n  "https://a", // product host\n];'
+    assert _allowlist_arrays(_strip_ts_comments(ref_src), "ALLOWED_ORIGINS") == [
+        '"https://a"'
+    ]
+
+
 def test_edge_function_allowlist_parity_with_waitlist_subscribe():
     """EVERY function that declares an allowlist must agree with
     waitlist-subscribe (the keep-in-sync comment in
@@ -329,45 +553,8 @@ def test_edge_function_allowlist_parity_with_waitlist_subscribe():
     # which is the point. Every HTTP-facing function must declare an allowlist —
     # `_shared` has no browser surface and is skipped explicitly, not by
     # accident. The glob covers the extensions Supabase accepts, not just `.ts`.
-    def pattern_for(const: str) -> re.Pattern[str]:
-        # The optional opening paren accepts a parenthesised literal
-        # (`= ([...] as const)`), which is a literal the sweep must compare rather
-        # than report as absent.
-        return re.compile(
-            rf"(?:export\s+)?(?:const|let|var)\s+{const}\s*(?::[^=\n]+)?=\s*\(?\s*\[([^\]]*)\]"
-        )
 
-    def unreadable_declarations(text: str, const: str) -> list[str]:
-        """A declaration of `const` whose right-hand side is not an array literal.
-
-        Reading literals alone cannot see a wrapped or imported value, so a file
-        could serve `Object.freeze([...])` or `makeOrigins()` while a commented
-        literal satisfied the comparison — measured GREEN with a comment copy of
-        the reference above a served non-literal. A declaration the sweep cannot
-        read is a RED, not a gap.
-
-        Per line, and comment lines are skipped: a commented example is not a
-        declaration, and matching raw text turned `// let ALLOWED_ORIGINS =
-        makeOrigins();` and a JSDoc `@example` into false REDs whose remedy ("make
-        it an array literal") was already satisfied. A parenthesised literal is
-        accepted (`= ([...] as const)`), and so is one broken after `=`.
-        """
-        pat = re.compile(
-            rf"(?:export\s+)?(?:const|let|var)\s+{const}\s*(?::[^=\n]+)?=(?!\s*\(*\s*\[)"
-        )
-        out: list[str] = []
-        for line in text.splitlines():
-            stripped = line.strip()
-            if stripped.startswith(("//", "*", "/*")):
-                continue
-            if pat.search(line):
-                out.append(stripped[:80])
-        return out
-
-    def values(text: str, pat: re.Pattern[str]) -> list[str]:
-        return [" ".join(hit.split()) for hit in pat.findall(text)]
-
-    decl = pattern_for("ALLOWED_ORIGINS")
+    decl = _allowlist_pattern("ALLOWED_ORIGINS")
     declaring: dict[str, str] = {}
     missing: list[str] = []
     unreadable: list[str] = []
@@ -379,15 +566,20 @@ def test_edge_function_allowlist_parity_with_waitlist_subscribe():
             f for f in sorted(fn_dir.rglob("*"))
             if f.suffix in {".ts", ".tsx", ".mts", ".cts"}
         ]
-        hits = [f for f in files if decl.search(f.read_text())]
-        wrapped = [f for f in files if unreadable_declarations(f.read_text(), "ALLOWED_ORIGINS")]
+        # Compare CODE, not text: a literal sitting inside a comment is neither a
+        # declaration nor a reason to red (a comment documenting an older allowlist
+        # must not fail the guard), and a declaration sharing a line with a block
+        # comment must still be examined.
+        code = {f: _strip_ts_comments(f.read_text()) for f in files}
+        hits = [f for f in files if decl.search(code[f])]
+        wrapped = [f for f in files if _unreadable_allowlist_declarations(code[f], "ALLOWED_ORIGINS")]
         if not hits and not wrapped:
             missing.append(fn_dir.name)
         unreadable.extend(
             f"{fn_dir.name}/{f.relative_to(fn_dir)}" for f in wrapped
         )
         for hit in hits:
-            declaring[f"{fn_dir.name}/{hit.relative_to(fn_dir)}"] = hit.read_text()
+            declaring[f"{fn_dir.name}/{hit.relative_to(fn_dir)}"] = code[hit]
     # The specific diagnosis first: a declaration the sweep cannot READ is not an
     # absent one, and the two need different remedies.
     assert not unreadable, (
@@ -404,17 +596,20 @@ def test_edge_function_allowlist_parity_with_waitlist_subscribe():
         "function whose drift fails SHUT."
     )
     assert len(declaring) >= 2, f"allowlist sweep found only {sorted(declaring)}"
-    waitlist = (
-        _REPO_ROOT / "supabase" / "functions" / "waitlist-subscribe" / "handle.ts"
-    ).read_text()
-    for const, pat in (
-        ("ALLOWED_ORIGINS", decl),
-        ("ORIGIN_SUFFIXES", pattern_for("ORIGIN_SUFFIXES")),
-    ):
-        want = values(waitlist, pat)
+    # The reference is stripped too: it is the anchor for every comparison, so a
+    # comment in it that mentions the constant must not red an honest change —
+    # measured, a trailing `// product host` inside the reference array failed the
+    # guard and blamed deck-view, a file nobody had touched.
+    waitlist = _strip_ts_comments(
+        (
+            _REPO_ROOT / "supabase" / "functions" / "waitlist-subscribe" / "handle.ts"
+        ).read_text()
+    )
+    for const in ("ALLOWED_ORIGINS", "ORIGIN_SUFFIXES"):
+        want = _allowlist_arrays(waitlist, const)
         assert len(want) == 1, f"the reference must declare {const} exactly once"
         for name, src in sorted(declaring.items()):
-            have = values(src, pat)
+            have = _allowlist_arrays(src, const)
             assert have, (
                 f"{name} declares no {const} the sweep can read — a declaration "
                 "the sweep cannot parse is a RED, not a gap: declare it inline as "
