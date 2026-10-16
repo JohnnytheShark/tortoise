@@ -301,28 +301,130 @@ def test_edge_function_allowlists_welcome_page_origins():
 
 
 def test_edge_function_allowlist_parity_with_waitlist_subscribe():
-    """ALLOWED_ORIGINS + ORIGIN_SUFFIXES must stay identical to
-    waitlist-subscribe (keep-in-sync comment in index.ts) so a host added for
-    the welcome page in one function can never silently drift from the other
+    """EVERY function that declares an allowlist must agree with
+    waitlist-subscribe (the keep-in-sync comment in
+    tenant-provision/index.ts) so a host added for
+    the welcome page in one function can never silently drift from the others
     (the #1110 failure mode). Local-origin handling deliberately diverges
     (tenant-provision: any local port; waitlist: 8788 only) and is NOT
-    compared."""
-    def extract(consts: str, name: str) -> str:
-        m = re.search(rf"const {name} = \[([^\]]*)\]", consts)
-        assert m, f"{name} not found"
-        return " ".join(m.group(1).split())
+    compared.
 
-    def arrays(src_text: str) -> str:
-        return extract(src_text, "ALLOWED_ORIGINS") + "|" + extract(src_text, "ORIGIN_SUFFIXES")
+    Enumerated rather than named: the guard originally compared two functions,
+    and a third (deck-view, #8732) joined them unguarded. Its failure mode is
+    fail-SHUT — the gate answers 403 and the deck stays locked — so a host
+    added to the guarded pair while deck-view drifts would lock readers out with
+    nothing red.
+    """
+    # ONE pattern per constant does both jobs — finding the declaring files and
+    # reading their values — so the enumerated set and the compared set cannot
+    # diverge. When they were separate (`decl` accepting `const|let|var`,
+    # `declared_lists` parsing only `const NAME = [`), a `let ALLOWED_ORIGINS =
+    # [...]` was enumerated but not parsed: a comment decoy satisfied the
+    # comparison while the served array rode free (measured: a comment decoy
+    # above a `let` missing `app.premiselabs.co` passed). An optional type
+    # annotation is accepted so a typed declaration is compared, not reported as
+    # absent. Enumerated by FUNCTION, not by the files that happen to contain the
+    # literal: a sweep keyed on the literal would drop a file the moment the
+    # constant is renamed — and dropping it is LOUD (the `missing` check fires),
+    # which is the point. Every HTTP-facing function must declare an allowlist —
+    # `_shared` has no browser surface and is skipped explicitly, not by
+    # accident. The glob covers the extensions Supabase accepts, not just `.ts`.
+    def pattern_for(const: str) -> re.Pattern[str]:
+        # The optional opening paren accepts a parenthesised literal
+        # (`= ([...] as const)`), which is a literal the sweep must compare rather
+        # than report as absent.
+        return re.compile(
+            rf"(?:export\s+)?(?:const|let|var)\s+{const}\s*(?::[^=\n]+)?=\s*\(?\s*\[([^\]]*)\]"
+        )
 
+    def unreadable_declarations(text: str, const: str) -> list[str]:
+        """A declaration of `const` whose right-hand side is not an array literal.
+
+        Reading literals alone cannot see a wrapped or imported value, so a file
+        could serve `Object.freeze([...])` or `makeOrigins()` while a commented
+        literal satisfied the comparison — measured GREEN with a comment copy of
+        the reference above a served non-literal. A declaration the sweep cannot
+        read is a RED, not a gap.
+
+        Per line, and comment lines are skipped: a commented example is not a
+        declaration, and matching raw text turned `// let ALLOWED_ORIGINS =
+        makeOrigins();` and a JSDoc `@example` into false REDs whose remedy ("make
+        it an array literal") was already satisfied. A parenthesised literal is
+        accepted (`= ([...] as const)`), and so is one broken after `=`.
+        """
+        pat = re.compile(
+            rf"(?:export\s+)?(?:const|let|var)\s+{const}\s*(?::[^=\n]+)?=(?!\s*\(*\s*\[)"
+        )
+        out: list[str] = []
+        for line in text.splitlines():
+            stripped = line.strip()
+            if stripped.startswith(("//", "*", "/*")):
+                continue
+            if pat.search(line):
+                out.append(stripped[:80])
+        return out
+
+    def values(text: str, pat: re.Pattern[str]) -> list[str]:
+        return [" ".join(hit.split()) for hit in pat.findall(text)]
+
+    decl = pattern_for("ALLOWED_ORIGINS")
+    declaring: dict[str, str] = {}
+    missing: list[str] = []
+    unreadable: list[str] = []
+    functions_dir = _REPO_ROOT / "supabase" / "functions"
+    for fn_dir in sorted(p for p in functions_dir.iterdir() if p.is_dir()):
+        if fn_dir.name == "_shared":
+            continue
+        files = [
+            f for f in sorted(fn_dir.rglob("*"))
+            if f.suffix in {".ts", ".tsx", ".mts", ".cts"}
+        ]
+        hits = [f for f in files if decl.search(f.read_text())]
+        wrapped = [f for f in files if unreadable_declarations(f.read_text(), "ALLOWED_ORIGINS")]
+        if not hits and not wrapped:
+            missing.append(fn_dir.name)
+        unreadable.extend(
+            f"{fn_dir.name}/{f.relative_to(fn_dir)}" for f in wrapped
+        )
+        for hit in hits:
+            declaring[f"{fn_dir.name}/{hit.relative_to(fn_dir)}"] = hit.read_text()
+    # The specific diagnosis first: a declaration the sweep cannot READ is not an
+    # absent one, and the two need different remedies.
+    assert not unreadable, (
+        f"these declarations are not array literals: {unreadable} — the sweep "
+        "reads literals, so a wrapped or imported allowlist cannot be compared "
+        "(and a commented literal beside it would pass while the served value "
+        "drifted). Declare it inline as a literal array, or extend the sweep."
+    )
+    assert not missing, (
+        f"these functions declare no ALLOWED_ORIGINS: {missing} — an HTTP-facing "
+        "function needs one. If it declares one the sweep cannot READ, that is "
+        "the other assertion; do NOT add the function to the `_shared` skip, "
+        "which would trade a loud failure for a permanent false green on a "
+        "function whose drift fails SHUT."
+    )
+    assert len(declaring) >= 2, f"allowlist sweep found only {sorted(declaring)}"
     waitlist = (
         _REPO_ROOT / "supabase" / "functions" / "waitlist-subscribe" / "handle.ts"
     ).read_text()
-    src = EDGE_FN.read_text()
-    assert arrays(src) == arrays(waitlist), (
-        "ALLOWED_ORIGINS/ORIGIN_SUFFIXES must match waitlist-subscribe — "
-        "change both files together (see keep-in-sync comment in index.ts)"
-    )
+    for const, pat in (
+        ("ALLOWED_ORIGINS", decl),
+        ("ORIGIN_SUFFIXES", pattern_for("ORIGIN_SUFFIXES")),
+    ):
+        want = values(waitlist, pat)
+        assert len(want) == 1, f"the reference must declare {const} exactly once"
+        for name, src in sorted(declaring.items()):
+            have = values(src, pat)
+            assert have, (
+                f"{name} declares no {const} the sweep can read — a declaration "
+                "the sweep cannot parse is a RED, not a gap: declare it inline as "
+                "an array literal, or extend the sweep. Do not skip the file."
+            )
+            assert all(h == want[0] for h in have), (
+                f"{name} {const} must match waitlist-subscribe in EVERY "
+                "declaration — change every declaring function together (see "
+                "the keep-in-sync comment in tenant-provision/index.ts)"
+            )
 
 
 def test_edge_function_rejects_unknown_origins():
